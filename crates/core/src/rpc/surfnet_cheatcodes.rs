@@ -32,7 +32,9 @@ use crate::{
     error::SurfpoolError,
     rpc::{
         State,
-        utils::{decode_and_deserialize, verify_pubkey, verify_pubkeys},
+        utils::{
+            decode_and_deserialize, require_signature_structure, verify_pubkey, verify_pubkeys,
+        },
     },
     surfnet::{
         AccountSource, GetAccountResult, locker::SvmAccessContext, svm::AccountUpdatePolicy,
@@ -1946,6 +1948,9 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 transaction_data_b64,
                 solana_transaction_status::TransactionBinaryEncoding::Base64,
             )?;
+            // A signature list that does not fit its message is refused before profiling
+            // reads a signature or acquires an account.
+            require_signature_structure(&transaction, "Transaction")?;
 
             let SurfnetRpcContext {
                 svm_locker,
@@ -2010,18 +2015,22 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 // update the supply fields if provided
                 if let Some(total) = update.total {
                     svm_writer.total_supply = total;
+                    svm_writer.supply_overrides.total = true;
                 }
 
                 if let Some(circulating) = update.circulating {
                     svm_writer.circulating_supply = circulating;
+                    svm_writer.supply_overrides.circulating = true;
                 }
 
                 if let Some(non_circulating) = update.non_circulating {
                     svm_writer.non_circulating_supply = non_circulating;
+                    svm_writer.supply_overrides.non_circulating = true;
                 }
 
                 if let Some(ref accounts) = update.non_circulating_accounts {
                     svm_writer.non_circulating_accounts = accounts.clone();
+                    svm_writer.supply_overrides.non_circulating_accounts = true;
                 }
 
                 svm_writer.get_latest_absolute_slot()
@@ -2696,6 +2705,38 @@ mod tests {
              synthetic entry: {:?}",
             after.runbook_executions
         );
+    }
+
+    /// surfnet_profileTransaction refuses a transaction without signatures as invalid params
+    /// before profiling reads a signature or acquires an account.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_profile_transaction_refuses_a_transaction_without_signatures() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let payer = Keypair::new();
+        let unsigned = Transaction::new_with_payer(
+            &[create_account(
+                &payer.pubkey(),
+                &Pubkey::new_unique(),
+                1,
+                0,
+                &Pubkey::new_unique(),
+            )],
+            Some(&payer.pubkey()),
+        );
+        let mut tx = VersionedTransaction::from(unsigned);
+        tx.signatures.clear();
+        let refused = client
+            .rpc
+            .profile_transaction(
+                Some(client.context.clone()),
+                base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap()),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, jsonrpc_core::ErrorCode::InvalidParams);
+        assert_eq!(refused.message, "Transaction has no signatures");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4998,7 +5039,11 @@ mod tests {
         .unwrap();
 
         // Simulate the transaction
-        let sim_result = client.context.svm_locker.simulate_transaction(tx, false);
+        let sim_result = client
+            .context
+            .svm_locker
+            .simulate_transaction(tx, false)
+            .expect("simulation reaches the backend");
 
         // The error program returns r0=1, which should cause an InstructionError.
         // If the noop (r0=0) is still cached, this would incorrectly succeed.
@@ -5044,6 +5089,7 @@ mod tests {
             .context
             .svm_locker
             .simulate_transaction(tx, false)
+            .expect("simulation reaches the backend")
             .map(|_| ())
             .map_err(|e| format!("{:?}", e.err))
     }
@@ -5057,6 +5103,7 @@ mod tests {
             .context
             .svm_locker
             .get_account_local(&programdata_address)
+            .unwrap()
             .inner
             .map_account()
             .unwrap()
