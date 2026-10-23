@@ -355,7 +355,6 @@ pub struct StartAccountOptions {
     #[arg(
         long = "airdrop-keypair-path",
         short = 'k',
-        default_value = DEFAULT_SOLANA_KEYPAIR_PATH.as_str(),
         value_name = "KEYPAIR_PATH",
         long_help = "Keypair path whose pubkey should receive an airdrop. Can be specified multiple times.\n\nExample: surfpool start --airdrop-keypair-path ~/.config/solana/id.json"
     )]
@@ -544,6 +543,11 @@ impl StartSimnet {
     pub fn get_airdrop_addresses(&self) -> (Vec<Pubkey>, Vec<SimnetEvent>) {
         let mut airdrop_addresses = vec![];
         let mut events = vec![];
+        if self.historical.after.is_some() {
+            events.push(SimnetEvent::warn(
+                "Historical mode does not fund the implicit Solana CLI keypair. Use disposable keys: signatures with a recent blockhash or a durable nonce may also be valid on the source network. Explicit -k/--airdrop opts into funding; this mitigation is not cryptographic domain separation.",
+            ));
+        }
 
         for address in self.accounts.airdrop_addresses.iter() {
             match Pubkey::from_str(address).map_err(|e| e.to_string()) {
@@ -559,6 +563,9 @@ impl StartSimnet {
         }
 
         let airdrop_keypair_path = self.accounts.airdrop_keypair_path.clone();
+        if airdrop_keypair_path.is_empty() && self.historical.after.is_some() {
+            return (airdrop_addresses, events);
+        }
 
         if airdrop_keypair_path.is_empty() {
             let default_resolved_path = resolve_path(&DEFAULT_SOLANA_KEYPAIR_PATH);

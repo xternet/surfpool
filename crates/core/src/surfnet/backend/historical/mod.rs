@@ -691,6 +691,232 @@ mod tests {
 
     use super::{Pins, Position, query};
 
+    #[cfg(unix)]
+    mod security_admission {
+        use super::*;
+
+        // A deterministic IPC peer exercises Surfpool's real admission paths without native
+        // execution or provider traffic. Every request is retained to prove refusal ordering.
+        fn ipc_fixture(count: usize) -> (super::super::HistoricalFork, tempfile::TempDir) {
+            use super::super::{HistoricalFork, HistoricalLaunch, HistoricalVm, StateView, client};
+            use std::sync::Arc;
+            let dir = tempfile::tempdir().unwrap();
+            let keys: Vec<String> = (0..count)
+                .map(|_| Pubkey::new_unique().to_string())
+                .collect();
+            let script = r#"
+import json, sys
+keys = json.loads(sys.argv[1])
+log = sys.argv[2]
+print(json.dumps({'schema':'svm-historical-backend/v1','kind':'ready','pins':{}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    op = req['op']
+    if op == 'shutdown':
+        print(json.dumps({'id':req['id'],'result':None}), flush=True)
+        break
+    with open(log, 'a') as out: out.write(json.dumps(req) + '\n')
+    if isinstance(op, dict) and 'archive' in op:
+        kind = op['archive']['kind']
+        if kind == 'tokenAccountsByOwner': result = {'accounts':keys}
+        elif kind == 'tokenHolders': result = {'holders':[], 'touched':keys, 'mintAtParent':False, 'complete':True}
+        else: result = None
+    elif isinstance(op, dict) and 'peek' in op:
+        result = [{'loaded':False} for _ in op['peek']['pubkeys']]
+    elif isinstance(op, dict) and op.get('command', {}).get('method') == 'accounts':
+        result = [None for _ in op['command']['params']['pubkeys']]
+    else: raise RuntimeError('unexpected request: ' + repr(req))
+    print(json.dumps({'id':req['id'],'result':result}), flush=True)
+"#;
+            let launch = HistoricalLaunch {
+                program: "/usr/bin/python3".into(),
+                args: vec![
+                    "-u".into(),
+                    "-c".into(),
+                    script.into(),
+                    serde_json::to_string(&keys).unwrap().into(),
+                    dir.path().join("requests.jsonl").into(),
+                ],
+                envs: vec![],
+            };
+            let backend = client::HistoricalBackend::launch(
+                &launch,
+                Arc::new(|line| eprintln!("{line}")),
+                || false,
+            )
+            .unwrap();
+            let fork = HistoricalFork {
+                vm: HistoricalVm::main(backend),
+                view: StateView {
+                    clock: Default::default(),
+                    epoch_schedule: Default::default(),
+                    rent: Default::default(),
+                },
+                faucet: None,
+                pins: Arc::new(Pins {
+                    genesis_hash: Default::default(),
+                    slot: 123,
+                    parent_slot: 122,
+                    block_height: 42,
+                    transaction_index: 0,
+                    execution_blockhash: Default::default(),
+                    runtime: None,
+                }),
+            };
+            (fork, dir)
+        }
+
+        fn ipc_requests(dir: &tempfile::TempDir) -> Vec<serde_json::Value> {
+            match std::fs::read_to_string(dir.path().join("requests.jsonl")) {
+                Ok(lines) => lines
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => vec![],
+                Err(error) => panic!("cannot read IPC transcript: {error}"),
+            }
+        }
+
+        #[test]
+        fn security_historical_owner_candidates_refuse_101_before_accounts_ipc() {
+            use crate::{rpc::full::SurfpoolFullRpc, tests::helpers::TestSetup};
+            use solana_client::{
+                rpc_config::RpcAccountInfoConfig, rpc_request::TokenAccountsFilter,
+            };
+            let setup = TestSetup::new(SurfpoolFullRpc);
+            for count in [100, 101] {
+                let (fork, dir) = ipc_fixture(count);
+                let result = setup.context.svm_locker.historical_token_accounts_by_owner(
+                    &fork.archive_reader(),
+                    Pubkey::new_unique(),
+                    &TokenAccountsFilter::ProgramId(spl_token_interface::id()),
+                    &RpcAccountInfoConfig::default(),
+                );
+                if count == 100 {
+                    result.unwrap();
+                    assert_eq!(
+                        ipc_requests(&dir)
+                            .iter()
+                            .filter(|r| r["op"]["command"]["method"] == "accounts")
+                            .count(),
+                        100
+                    );
+                } else {
+                    let error = result.err().expect("101 candidates must be refused");
+                    assert_eq!(error.historical_code(), Some("HISTORICAL_DATA_UNAVAILABLE"));
+                    assert!(
+                        !ipc_requests(&dir)
+                            .iter()
+                            .any(|r| r["op"]["command"]["method"] == "accounts")
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn security_historical_holders_refuse_101_before_accounts_ipc() {
+            use crate::{rpc::full::SurfpoolFullRpc, tests::helpers::TestSetup};
+            let setup = TestSetup::new(SurfpoolFullRpc);
+            for count in [100, 101] {
+                let (fork, dir) = ipc_fixture(count);
+                let result = setup.context.svm_locker.historical_token_largest_accounts(
+                    &fork.archive_reader(),
+                    &Pubkey::new_unique(),
+                );
+                if count == 100 {
+                    result.unwrap();
+                    assert_eq!(
+                        ipc_requests(&dir)
+                            .iter()
+                            .filter(|r| r["op"]["command"]["method"] == "accounts")
+                            .count(),
+                        101,
+                        "100 holders plus one mint"
+                    );
+                } else {
+                    let error = result.err().expect("101 unloaded holders must be refused");
+                    assert_eq!(error.historical_code(), Some("HISTORICAL_DATA_UNAVAILABLE"));
+                    assert!(
+                        !ipc_requests(&dir)
+                            .iter()
+                            .any(|r| r["op"]["command"]["method"] == "accounts")
+                    );
+                }
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn security_historical_statuses_refuse_257_before_archive_ipc() {
+            use crate::{
+                rpc::full::{Full, SurfpoolFullRpc},
+                tests::helpers::TestSetup,
+            };
+            let setup = TestSetup::new(SurfpoolFullRpc);
+            let (fork, dir) = ipc_fixture(0);
+            setup.context.svm_locker.with_svm_writer(|svm| {
+                svm.inner = crate::surfnet::backend::Backend::historical(fork)
+            });
+            for count in [256, 257] {
+                let result = setup
+                    .rpc
+                    .get_signature_statuses(
+                        Some(setup.context.clone()),
+                        vec![solana_signature::Signature::new_unique().to_string(); count],
+                        Some(solana_client::rpc_config::RpcSignatureStatusConfig {
+                            search_transaction_history: true,
+                        }),
+                    )
+                    .await;
+                if count == 256 {
+                    assert_eq!(result.unwrap().value.len(), 256);
+                    assert_eq!(ipc_requests(&dir).len(), 256);
+                } else {
+                    let error = result.expect_err("257 signatures must be refused");
+                    assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+                    assert!(error.message.contains("256"), "{error}");
+                    assert_eq!(
+                        ipc_requests(&dir).len(),
+                        256,
+                        "refusal must not query archive"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn security_program_upload_refused_before_historical_acquisition() {
+            use crate::{rpc::full::SurfpoolFullRpc, tests::helpers::TestSetup};
+            let setup = TestSetup::new(SurfpoolFullRpc);
+            let (fork, dir) = ipc_fixture(0);
+            setup.context.svm_locker.with_svm_writer(|svm| {
+                svm.inner = crate::surfnet::backend::Backend::historical(fork)
+            });
+            let error = setup
+                .context
+                .svm_locker
+                .write_program(
+                    Pubkey::new_unique(),
+                    None,
+                    solana_system_interface::MAX_PERMITTED_DATA_LENGTH as usize,
+                    &[1],
+                    &None,
+                )
+                .await
+                .expect_err("oversized upload must fail");
+            assert!(error.to_string().contains("program write"), "{error}");
+            assert!(
+                ipc_requests(&dir).is_empty(),
+                "oversized upload must not acquire accounts"
+            );
+            assert!(
+                setup
+                    .context
+                    .svm_locker
+                    .with_svm_reader(|svm| svm.historical_uploads.is_empty())
+            );
+        }
+    }
+
     /// SVM Replay's position and pins reach Surfpool as typed facts: a missing or malformed chain
     /// pin or position field is a typed backend error, never a default.
     #[test]

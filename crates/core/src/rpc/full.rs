@@ -1659,6 +1659,12 @@ impl Full for SurfpoolFullRpc {
             Ok(res) => res,
             Err(e) => return e.into(),
         };
+        if signatures.len() > 256 && svm_locker.is_historical() {
+            return SurfpoolError::invalid_params(
+                "historical getSignatureStatuses accepts at most 256 signatures",
+            )
+            .into();
+        }
         let remote_client = if search_transaction_history {
             remote_ctx.map(|(remote_client, _)| remote_client)
         } else {
@@ -3374,6 +3380,21 @@ mod tests {
                 .expect_err(&format!("{config:?} should be rejected"));
             assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn security_normal_signature_status_count_behavior_is_preserved() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let result = setup
+            .rpc
+            .get_signature_statuses(
+                Some(setup.context),
+                vec![Signature::new_unique().to_string(); 257],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value.len(), 257);
     }
 
     #[tokio::test(flavor = "multi_thread")]

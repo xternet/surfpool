@@ -4904,6 +4904,20 @@ impl SurfnetSvmLocker {
     }
 }
 
+/// The uploaded bytes must fit beside the loader metadata in one Solana account.
+pub(crate) fn program_write_end(offset: usize, len: usize) -> SurfpoolResult<usize> {
+    let max = solana_system_interface::MAX_PERMITTED_DATA_LENGTH as usize
+        - solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata();
+    offset
+        .checked_add(len)
+        .filter(|end| *end <= max)
+        .ok_or_else(|| {
+            SurfpoolError::invalid_params(format!(
+                "program write exceeds maximum program data length of {max} bytes"
+            ))
+        })
+}
+
 /// Helpers for writing program accounts
 impl SurfnetSvmLocker {
     pub async fn write_program(
@@ -4914,6 +4928,7 @@ impl SurfnetSvmLocker {
         data: &[u8],
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     ) -> SurfpoolResult<()> {
+        program_write_end(offset, data.len())?;
         if self.is_historical() {
             return self
                 .write_historical_program(program_id, authority, offset, data, remote_ctx)
@@ -4967,6 +4982,7 @@ impl SurfnetSvmLocker {
         data: &[u8],
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     ) -> SurfpoolResult<()> {
+        let end = program_write_end(offset, data.len())?;
         let program_data_address = get_program_data_address(&program_id);
         let existing = self.get_account(remote_ctx, &program_id, None).await?.inner;
         if !existing.is_none() {
@@ -4979,9 +4995,6 @@ impl SurfnetSvmLocker {
                 ));
             }
         }
-        let end = offset
-            .checked_add(data.len())
-            .ok_or_else(|| SurfpoolError::invalid_params("program write overflows"))?;
         let elf = self.with_svm_writer(|svm_writer| {
             let upload = svm_writer.historical_uploads.entry(program_id).or_default();
             if upload.len() < end {
@@ -5170,6 +5183,7 @@ impl SurfnetSvmLocker {
         data: &[u8],
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     ) -> SurfpoolResult<Account> {
+        program_write_end(offset, data.len())?;
         // Get or create program data account
         let SvmAccessContext {
             inner: program_data_result,
@@ -5423,6 +5437,26 @@ fn update_programdata_account(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn security_program_upload_end_includes_metadata_and_rejects_overflow() {
+        let metadata =
+            solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata(
+            );
+        let max = solana_system_interface::MAX_PERMITTED_DATA_LENGTH as usize - metadata;
+        assert_eq!(super::program_write_end(max - 1, 1).unwrap(), max);
+        assert_eq!(super::program_write_end(0, max).unwrap(), max);
+        for (offset, len) in [
+            (max, 1),
+            (0, max + 1),
+            (usize::MAX, 1),
+            (usize::MAX, usize::MAX),
+        ] {
+            let error: jsonrpc_core::Error =
+                super::program_write_end(offset, len).unwrap_err().into();
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+        }
+    }
+
     /// Only a table deactivated in an earlier slot is judged by SlotHashes.
     #[test]
     fn only_a_table_deactivated_earlier_needs_slot_hashes() {

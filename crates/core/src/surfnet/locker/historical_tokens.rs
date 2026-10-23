@@ -104,6 +104,12 @@ impl SurfnetSvmLocker {
                 .into_iter()
                 .map(|(pubkey, _)| pubkey),
         );
+        if candidates.len() > 100 {
+            return Err(SurfpoolError::historical_unavailable(
+                "getTokenAccountsByOwner",
+                "at most 100 candidate accounts can be acquired per query",
+            ));
+        }
         let candidates: Vec<Pubkey> = candidates.into_iter().collect();
         let mut found = Vec::new();
         for (pubkey, image) in candidates.iter().zip(reader.accounts(&candidates)?) {
@@ -207,6 +213,12 @@ impl SurfnetSvmLocker {
                     }
                     None => {}
                 }
+            }
+            if unloaded.len() > 100 {
+                return Err(SurfpoolError::historical_unavailable(
+                    "getTokenLargestAccounts",
+                    "at most 100 unloaded holder accounts can be acquired per query",
+                ));
             }
             images.extend(unloaded.iter().copied().zip(reader.accounts(&unloaded)?));
             for (pubkey, image) in images {

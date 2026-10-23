@@ -1,6 +1,49 @@
 use super::*;
 
 #[test]
+fn security_historical_airdrops_are_explicit_and_warn_about_signing_risk() {
+    let cmd = StartSimnet::try_parse_from(["start", "--after", "1"]).unwrap();
+    assert!(
+        cmd.accounts.airdrop_keypair_path.is_empty(),
+        "implicit path must not look explicit"
+    );
+    let (addresses, events) = cmd.get_airdrop_addresses();
+    assert!(addresses.is_empty());
+    let warning = format!("{events:?}");
+    for risk in [
+        "recent blockhash",
+        "durable nonce",
+        "disposable",
+        "domain separation",
+    ] {
+        assert!(warning.contains(risk), "missing {risk}: {warning}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let key = Keypair::new();
+    let path = dir.path().join("disposable.json");
+    key.write_to_file(&path).unwrap();
+    for historical in [false, true] {
+        let mut argv = vec![
+            "start",
+            "--airdrop",
+            "11111111111111111111111111111111",
+            "-k",
+            path.to_str().unwrap(),
+        ];
+        if historical {
+            argv.extend(["--after", "1"]);
+        }
+        let cmd = StartSimnet::try_parse_from(argv).unwrap();
+        assert_eq!(
+            cmd.get_airdrop_addresses().0,
+            vec![Pubkey::default(), key.pubkey()]
+        );
+    }
+    let normal = StartSimnet::try_parse_from(["start"]).unwrap();
+    assert!(!format!("{:?}", normal.get_airdrop_addresses().1).contains("domain separation"));
+}
+
+#[test]
 fn interfaces_learn_what_a_historical_surfnet_forks_after_instead_of_a_datasource() {
     let historical = StartSimnet::try_parse_from(["start", "--after", "413023260"]).unwrap();
     assert_eq!(
