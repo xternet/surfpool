@@ -437,6 +437,13 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             Err(e) => return e.into(),
         };
 
+        if pubkeys.len() > 100 && svm_locker.is_historical() {
+            return SurfpoolError::invalid_params(
+                "historical getMultipleAccounts accepts at most 100 accounts",
+            )
+            .into();
+        }
+
         #[cfg(feature = "prometheus")]
         let rpc_start = std::time::Instant::now();
 

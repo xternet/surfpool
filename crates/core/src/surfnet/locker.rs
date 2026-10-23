@@ -4539,18 +4539,23 @@ impl SurfnetSvmLocker {
         end: Slot,
         limit: usize,
     ) -> SurfpoolResult<Vec<Slot>> {
-        const WINDOWS: usize = 50;
+        const WINDOWS: usize = 4;
+        const MAX_SCAN_SLOTS: u64 = 500_001;
         if end < start || limit == 0 {
             return Ok(vec![]);
         }
         let boundary = self.with_svm_reader(|svm_reader| svm_reader.genesis_slot);
         let mut slots: Vec<Slot> = Vec::new();
         let mut from = start;
+        let mut remaining_scan = MAX_SCAN_SLOTS;
         let window = (limit as u64).saturating_mul(2).clamp(64, 500_000);
         for _ in 0..WINDOWS {
+            if remaining_scan == 0 {
+                break;
+            }
             let to = end
                 .min(boundary.saturating_sub(1))
-                .min(from.saturating_add(window - 1));
+                .min(from.saturating_add(window.min(remaining_scan) - 1));
             if from >= boundary || to < from || slots.len() >= limit {
                 break;
             }
@@ -4562,12 +4567,13 @@ impl SurfnetSvmLocker {
                     None,
                 )
             })?);
+            remaining_scan -= to - from + 1;
             from = to + 1;
         }
         if slots.len() < limit && from <= end.min(boundary.saturating_sub(1)) && from < boundary {
             return Err(SurfpoolError::historical_unavailable(
                 "getBlocksWithLimit",
-                "the archived produced-slot search before the boundary reached its window bound",
+                "the archived produced-slot search reached its four-window/500001-slot work bound; narrow the search",
             ));
         }
         if end >= boundary {

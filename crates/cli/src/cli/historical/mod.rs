@@ -14,11 +14,11 @@ pub struct Options {
     /// Provider settings; uses ./Surfpool.toml when present.
     #[arg(long, value_name = "FILE", requires = "after")]
     historical_config: Option<PathBuf>,
-    /// Provider credential or env:VARIABLE; environment/file references are safer.
+    /// Provider credential reference env:VARIABLE; literal credentials are refused.
     #[arg(
         long = "key",
         alias = "historical-key",
-        value_name = "KEY|env:NAME",
+        value_name = "env:NAME",
         requires = "after",
         conflicts_with = "historical_key_file"
     )]
@@ -84,6 +84,16 @@ pub(super) fn config(cmd: &StartSimnet) -> Result<Option<HistoricalSimnetConfig>
     let Some(after) = &options.after else {
         return Ok(None);
     };
+    if options
+        .key
+        .as_ref()
+        .is_some_and(|key| !key.starts_with("env:") || key.len() == 4)
+    {
+        return Err(
+            "Use --key env:NAME or --key-file FILE; literal provider credentials are refused"
+                .into(),
+        );
+    }
     let config = match &options.historical_config {
         Some(path) => Some(path.clone()),
         None => match std::fs::symlink_metadata("Surfpool.toml") {

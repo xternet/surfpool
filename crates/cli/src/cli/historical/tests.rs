@@ -72,7 +72,7 @@ fn historical_runtime_registry_requires_and_forwards_its_independent_pin() {
 }
 
 #[test]
-fn the_backend_is_the_private_session_and_a_literal_key_stays_out_of_its_arguments() {
+fn the_backend_is_private_and_cli_credentials_require_references() {
     let cmd = StartSimnet::try_parse_from([
         "start",
         "--after",
@@ -81,6 +81,19 @@ fn the_backend_is_the_private_session_and_a_literal_key_stays_out_of_its_argumen
         "9991",
         "--key",
         "synthetic-not-a-real-key",
+    ])
+    .unwrap();
+    let error = config(&cmd).unwrap_err();
+    assert!(error.contains("--key env:NAME"), "{error}");
+    assert!(!error.contains("synthetic-not-a-real-key"), "{error}");
+    let cmd = StartSimnet::try_parse_from([
+        "start",
+        "--after",
+        "tx:signature",
+        "--port",
+        "9991",
+        "--key",
+        "env:MY_KEY",
     ])
     .unwrap();
     let config = config(&cmd).unwrap().unwrap();
@@ -111,15 +124,9 @@ fn the_backend_is_the_private_session_and_a_literal_key_stays_out_of_its_argumen
         config
             .args
             .windows(2)
-            .any(|pair| pair == ["--key", "env:SVM_REPLAY_HISTORICAL_KEY"])
+            .any(|pair| pair == ["--key", "env:MY_KEY"])
     );
-    assert_eq!(
-        config.envs,
-        vec![(
-            surfpool_types::HISTORICAL_KEY_ENV.to_string(),
-            "synthetic-not-a-real-key".to_string()
-        )]
-    );
+    assert!(config.envs.is_empty());
 
     let reference =
         StartSimnet::try_parse_from(["start", "--after", "1", "--key", "env:MY_KEY"]).unwrap();
@@ -131,6 +138,14 @@ fn the_backend_is_the_private_session_and_a_literal_key_stays_out_of_its_argumen
             .any(|pair| pair == ["--key", "env:MY_KEY"])
     );
     assert!(config.envs.is_empty());
+    let from_file =
+        StartSimnet::try_parse_from(["start", "--after", "1", "--key-file", "provider-key.txt"])
+            .unwrap();
+    assert!(
+        args(&from_file)
+            .windows(2)
+            .any(|pair| pair == ["--key-file", "provider-key.txt"])
+    );
 }
 
 #[test]

@@ -64,6 +64,28 @@ async fn two_historical_surfnets_are_isolated_and_stop_independently() {
         );
     }
 
+    let keys = vec![first.payer().pubkey(); 100];
+    assert_eq!(
+        first
+            .rpc_client()
+            .get_multiple_accounts(&keys)
+            .unwrap()
+            .len(),
+        100
+    );
+    let rejected = first
+        .rpc_client()
+        .get_multiple_accounts(&[first.payer().pubkey(); 101])
+        .unwrap_err();
+    assert!(rejected.to_string().contains("at most 100"), "{rejected}");
+    // Unknown keys must be refused before historical account acquisition too.
+    let rejected = first
+        .rpc_client()
+        .get_multiple_accounts(&[Pubkey::new_unique(); 101])
+        .unwrap_err();
+    assert!(rejected.to_string().contains("at most 100"), "{rejected}");
+    assert_eq!(first.rpc_client().get_slot().unwrap(), slot);
+
     let recipient = Keypair::new().pubkey();
     define(&first, &recipient, 0);
     define(&second, &recipient, 0);
